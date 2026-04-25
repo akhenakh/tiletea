@@ -10,8 +10,10 @@ import (
 	"image"
 	"image/color"
 	"io"
+	"log"
 	"math"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -24,6 +26,20 @@ import (
 	"github.com/peterstace/simplefeatures/carto"
 	"github.com/peterstace/simplefeatures/geom"
 )
+
+var debugEnabled bool
+
+func debugf(format string, args ...interface{}) {
+	if debugEnabled {
+		log.Printf(format, args...)
+	}
+}
+
+func debugln(args ...interface{}) {
+	if debugEnabled {
+		log.Println(args...)
+	}
+}
 
 // Cell dimensions in pixels (approximation for the terminal)
 const (
@@ -58,6 +74,10 @@ type MapStyle struct {
 	Layers []StyleLayer `json:"layers"`
 }
 
+type TileJSON struct {
+	Tiles []string `json:"tiles"`
+}
+
 // --- Map Model ---
 
 type MapModel struct {
@@ -83,15 +103,47 @@ type mapRenderedMsg struct {
 	seq string
 }
 
+func fetchTileURLTemplate(sourceURL string) string {
+	resp, err := http.Get(sourceURL)
+	if err != nil {
+		debugf("Failed to fetch TileJSON from %s: %v", sourceURL, err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	var tj TileJSON
+	if err := json.NewDecoder(resp.Body).Decode(&tj); err != nil {
+		debugf("Failed to decode TileJSON: %v", err)
+		return ""
+	}
+	if len(tj.Tiles) == 0 {
+		debugf("TileJSON contains no tile URLs")
+		return ""
+	}
+
+	template := tj.Tiles[0]
+	debugf("TileJSON resolved tile URL template: %s", template)
+	return template
+}
+
 func NewMapModel(lat, lng float64, zoom int) *MapModel {
 	var style MapStyle
-	_ = json.Unmarshal([]byte(defaultStyleJSON), &style)
+	if err := json.Unmarshal([]byte(defaultStyleJSON), &style); err != nil {
+		debugf("Error parsing default style JSON: %v", err)
+	} else {
+		debugf("Loaded style with %d layers", len(style.Layers))
+	}
+
+	tileURLTemplate := fetchTileURLTemplate("https://tiles.openfreemap.org/planet")
+	if tileURLTemplate == "" {
+		tileURLTemplate = "https://tiles.openfreemap.org/planet/%d/%d/%d.pbf"
+	}
 
 	return &MapModel{
 		Lat:             lat,
 		Lng:             lng,
 		Zoom:            zoom,
-		TileURLTemplate: "https://tiles.openfreemap.org/planet/%d/%d/%d.pbf",
+		TileURLTemplate: tileURLTemplate,
 		Style:           &style,
 		loading:         true,
 	}
@@ -105,6 +157,7 @@ func (m *MapModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
 	case tea.WindowSizeMsg:
+		debugf("Window resized to Width: %d, Height: %d", msg.Width, msg.Height)
 		m.Width = msg.Width
 		m.Height = msg.Height
 		return m, m.renderMapCmd()
@@ -112,15 +165,18 @@ func (m *MapModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
+			debugln("Quit requested.")
 			return m, tea.Quit
 		case "+":
 			if m.Zoom < 18 {
 				m.Zoom++
+				debugf("Zooming in to %d", m.Zoom)
 				return m, m.renderMapCmd()
 			}
 		case "-":
 			if m.Zoom > 0 {
 				m.Zoom--
+				debugf("Zooming out to %d", m.Zoom)
 				return m, m.renderMapCmd()
 			}
 		case "up", "k":
@@ -138,6 +194,7 @@ func (m *MapModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case mapRenderedMsg:
+		debugln("Map render completed and received by Update.")
 		m.loading = false
 		m.renderedImage = msg.img
 		m.kittySequence = msg.seq
@@ -153,13 +210,10 @@ func (m *MapModel) View() tea.View {
 	if m.loading && m.kittySequence == "" {
 		content = "Loading map...\nControls: Arrows to pan, +/- to zoom, q to quit."
 	} else {
-		// Print the kitty sequence. It binds to the terminal grid at the current cursor.
-		// We overlay some basic text information at the top.
 		header := fmt.Sprintf("Lat: %.4f | Lng: %.4f | Zoom: %d | Loading: %v\n", m.Lat, m.Lng, m.Zoom, m.loading)
 		content = header + m.kittySequence
 	}
 
-	// AltScreen is now set on the View struct in Bubble Tea v2
 	v := tea.NewView(content)
 	v.AltScreen = true
 	return v
@@ -169,7 +223,7 @@ func (m *MapModel) View() tea.View {
 
 func (m *MapModel) renderMapCmd() tea.Cmd {
 	if m.cancel != nil {
-		m.cancel()
+		m.cancel() // Cancel any ongoing render
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m.ctx = ctx
@@ -178,20 +232,21 @@ func (m *MapModel) renderMapCmd() tea.Cmd {
 
 	return func() tea.Msg {
 		if m.Width == 0 || m.Height == 0 {
+			debugln("Skipping render: width or height is 0")
 			return nil
 		}
 
 		pxWidth := m.Width * CellWidth
 		pxHeight := (m.Height - 1) * CellHeight // -1 for header
 
-		// Use simplefeatures/carto to get WebMercator coordinates
+		debugf("Starting map render: %dx%d pixels (zoom %d, lat: %.4f, lng: %.4f)", pxWidth, pxHeight, m.Zoom, m.Lat, m.Lng)
+
 		wm := carto.NewWebMercator(m.Zoom)
 
-		// Transform Lat/Lng to WebMercator tile space [0, 2^Zoom]
 		centerXY := wm.Forward(geom.XY{X: m.Lng, Y: m.Lat})
-
 		globalPxX := centerXY.X * TileSize
 		globalPxY := centerXY.Y * TileSize
+		debugf("Center XY: (%.4f, %.4f) -> globalPx: (%.2f, %.2f)", centerXY.X, centerXY.Y, globalPxX, globalPxY)
 
 		minPxX := globalPxX - float64(pxWidth)/2
 		minPxY := globalPxY - float64(pxHeight)/2
@@ -203,46 +258,62 @@ func (m *MapModel) renderMapCmd() tea.Cmd {
 		maxTileX := int(math.Floor(maxPxX / TileSize))
 		maxTileY := int(math.Floor(maxPxY / TileSize))
 
+		debugf("Pixel bounds: X[%.2f-%.2f], Y[%.2f-%.2f]", minPxX, maxPxX, minPxY, maxPxY)
+
 		dc := gg.NewContext(pxWidth, pxHeight)
 
 		// Draw Background
 		if bgLayer := getLayerByID(m.Style, "background"); bgLayer != nil {
 			dc.SetColor(parseColor(bgLayer.Paint.BackgroundColor))
-			dc.Clear()
 		} else {
 			dc.SetColor(color.RGBA{248, 244, 240, 255})
-			dc.Clear()
 		}
+		dc.Clear()
 
-		// Fetch and render tiles
+		debugf("Tiles required: X[%d-%d], Y[%d-%d]", minTileX, maxTileX, minTileY, maxTileY)
+
 		for ty := minTileY; ty <= maxTileY; ty++ {
 			for tx := minTileX; tx <= maxTileX; tx++ {
-				// Stop if context cancelled by newer render
 				if ctx.Err() != nil {
+					debugln("Render cancelled by context")
 					return nil
 				}
 
-				// Handle world wrap
 				maxTiles := 1 << m.Zoom
 				wrapTx := (tx%maxTiles + maxTiles) % maxTiles
 
-				tileData, err := fetchTile(fmt.Sprintf(m.TileURLTemplate, m.Zoom, wrapTx, ty))
+				url := strings.ReplaceAll(m.TileURLTemplate, "{z}", strconv.Itoa(m.Zoom))
+				url = strings.ReplaceAll(url, "{x}", strconv.Itoa(wrapTx))
+				url = strings.ReplaceAll(url, "{y}", strconv.Itoa(ty))
+				debugf("Fetching tile: %s", url)
+
+				tileData, err := fetchTile(url)
 				if err != nil {
+					debugf("Failed to fetch tile %s: %v", url, err)
 					continue
 				}
 
+				debugf("Fetched %d bytes for tile %d/%d/%d", len(tileData), m.Zoom, wrapTx, ty)
+
+				// Try to unmarshal (it might be gzipped, or our fetchTile already decompressed it)
 				collections, err := mvt.UnmarshalGzipped(tileData)
 				if err != nil {
+					debugf("UnmarshalGzipped failed: %v, trying plain Unmarshal", err)
 					collections, err = mvt.Unmarshal(tileData)
 					if err != nil {
+						debugf("Failed to unmarshal tile data: %v", err)
 						continue
 					}
+				}
+
+				debugf("Successfully unmarshalled tile. Found %d MVT layers.", len(collections))
+				for _, l := range collections {
+					debugf("  MVT layer: %q (extent=%d, features=%d)", l.Name, l.Extent, len(l.Features))
 				}
 
 				offsetX := float64(tx*TileSize) - minPxX
 				offsetY := float64(ty*TileSize) - minPxY
 
-				// Render layers in the exact order specified by style.json
 				for _, layerStyle := range m.Style.Layers {
 					if layerStyle.Type == "background" {
 						continue
@@ -256,17 +327,30 @@ func (m *MapModel) renderMapCmd() tea.Cmd {
 						}
 					}
 					if mvtLayer == nil {
+						debugf("  Style layer %q (source: %q): no matching MVT layer found", layerStyle.ID, layerStyle.SourceLayer)
 						continue
 					}
 
 					scale := TileSize / float64(mvtLayer.Extent)
+					debugf("  Style layer %q matched MVT %q: scale=%.4f, offsetX=%.2f, offsetY=%.2f, extent=%d, %d features",
+						layerStyle.ID, layerStyle.SourceLayer, scale, offsetX, offsetY, mvtLayer.Extent, len(mvtLayer.Features))
+					renderedCount := 0
+					filteredCount := 0
 
 					for _, feature := range mvtLayer.Features {
 						if !evaluateFilter(layerStyle.Filter, feature.Properties) {
+							filteredCount++
 							continue
 						}
 
 						drawFeature(dc, feature.Geometry, offsetX, offsetY, scale, &layerStyle)
+						renderedCount++
+					}
+
+					if renderedCount > 0 {
+						debugf("  -> Layer '%s' (source: %s): rendered %d features, filtered %d", layerStyle.ID, layerStyle.SourceLayer, renderedCount, filteredCount)
+					} else if filteredCount > 0 {
+						debugf("  -> Layer '%s' (source: %s): ALL %d features filtered out", layerStyle.ID, layerStyle.SourceLayer, filteredCount)
 					}
 				}
 			}
@@ -277,6 +361,8 @@ func (m *MapModel) renderMapCmd() tea.Cmd {
 			markerXY := wm.Forward(geom.XY{X: *m.MarkerLng, Y: *m.MarkerLat})
 			mx := markerXY.X*TileSize - minPxX
 			my := markerXY.Y*TileSize - minPxY
+
+			debugf("Drawing marker at screen px: (%.2f, %.2f)", mx, my)
 
 			dc.SetColor(color.RGBA{255, 0, 0, 255})
 			dc.DrawCircle(mx, my, 6)
@@ -290,11 +376,13 @@ func (m *MapModel) renderMapCmd() tea.Cmd {
 		img := dc.Image().(*image.RGBA)
 		seq := encodeKittyGraphics(img, m.Width, m.Height-1)
 
+		debugln("Render complete, sending mapRenderedMsg")
 		return mapRenderedMsg{img: img, seq: seq}
 	}
 }
 
 func drawFeature(dc *gg.Context, geometry orb.Geometry, offsetX, offsetY, scale float64, style *StyleLayer) {
+	debugf("    drawFeature: type=%T, offsetX=%.2f, offsetY=%.2f, scale=%.4f", geometry, offsetX, offsetY, scale)
 	switch g := geometry.(type) {
 	case orb.Polygon:
 		dc.SetColor(parseColor(style.Paint.FillColor))
@@ -374,6 +462,8 @@ func drawFeature(dc *gg.Context, geometry orb.Geometry, offsetX, offsetY, scale 
 
 func fetchTile(url string) ([]byte, error) {
 	req, _ := http.NewRequest("GET", url, nil)
+	// We set this to explicitly ask for gzip, but Go's http.Transport
+	// WILL still decompress it automatically and remove the header.
 	req.Header.Set("Accept-Encoding", "gzip")
 	req.Header.Set("User-Agent", "Charm-Bubbletea-MapViewer")
 
@@ -389,6 +479,7 @@ func fetchTile(url string) ([]byte, error) {
 	}
 
 	var reader io.Reader = resp.Body
+	// Just in case the server sent gzip and Go's transport DIDN'T strip it
 	if resp.Header.Get("Content-Encoding") == "gzip" {
 		reader, _ = gzip.NewReader(resp.Body)
 	}
@@ -475,7 +566,6 @@ func evaluateFilter(filter []interface{}, props geojson.Properties) bool {
 		}
 	}
 
-	// Default pass-through for unhandled complex filters
 	return true
 }
 
@@ -580,7 +670,17 @@ func hueToRGB(p, q, t float64) float64 {
 // --- Main execution ---
 
 func main() {
-	// NYC Coordinates
+	if len(os.Getenv("DEBUG")) > 0 {
+		debugEnabled = true
+		f, err := tea.LogToFile("debug.log", "debug")
+		if err != nil {
+			fmt.Println("fatal:", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		debugln("=== Starting Map Viewer ===")
+	}
+
 	nycLat, nycLng := 40.7128, -74.0060
 
 	// Initialize the Bubbletea map model
@@ -590,7 +690,7 @@ func main() {
 	model.MarkerLat = &nycLat
 	model.MarkerLng = &nycLng
 
-	p := tea.NewProgram(model) // WithAltScreen is handled in the View() func now
+	p := tea.NewProgram(model)
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Bubbletea Error: %v\n", err)
 	}
