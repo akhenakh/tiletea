@@ -48,12 +48,7 @@ const (
 	TileSize   = 256
 )
 
-// Default embedded style JSON
-const defaultStyleJSON = `
-{"version":8,"sources":{"openmaptiles":{"type":"vector","url":"https://tiles.openfreemap.org/planet"}},"layers":[{"id":"background","type":"background","paint":{"background-color":"#f8f4f0"}},{"id":"water","type":"fill","source-layer":"water","paint":{"fill-color":"rgb(158,189,255)"}},{"id":"park","type":"fill","source-layer":"park","paint":{"fill-color":"#d8e8c8"}},{"id":"landcover_wood","type":"fill","source-layer":"landcover","filter":["==","class","wood"],"paint":{"fill-color":"hsla(98,61%,72%,0.7)"}},{"id":"landcover_grass","type":"fill","source-layer":"landcover","filter":["==","class","grass"],"paint":{"fill-color":"rgba(176, 213, 154, 1)"}},{"id":"building","type":"fill","source-layer":"building","paint":{"fill-color":"hsl(35,8%,85%)"}},{"id":"waterway_river","type":"line","source-layer":"waterway","filter":["==","class","river"],"paint":{"line-color":"#a0c8f0","line-width":2}},{"id":"road_motorway","type":"line","source-layer":"transportation","filter":["==","class","motorway"],"paint":{"line-color":"#fc8","line-width":3}},{"id":"road_primary","type":"line","source-layer":"transportation","filter":["==","class","primary"],"paint":{"line-color":"#fea","line-width":2}}]}
-`
-
-// --- Style Parsing Types ---
+const defaultStyleURL = "https://tiles.openfreemap.org/styles/liberty"
 
 type StyleLayer struct {
 	ID          string        `json:"id"`
@@ -61,13 +56,18 @@ type StyleLayer struct {
 	SourceLayer string        `json:"source-layer"`
 	Paint       PaintProps    `json:"paint"`
 	Filter      []interface{} `json:"filter"`
+	MinZoom     *float64      `json:"minzoom"`
+	MaxZoom     *float64      `json:"maxzoom"`
 }
 
 type PaintProps struct {
 	BackgroundColor interface{} `json:"background-color"`
 	FillColor       interface{} `json:"fill-color"`
+	FillOpacity     interface{} `json:"fill-opacity"`
 	LineColor       interface{} `json:"line-color"`
 	LineWidth       interface{} `json:"line-width"`
+	LineOpacity     interface{} `json:"line-opacity"`
+	LineDashArray   interface{} `json:"line-dasharray"`
 }
 
 type MapStyle struct {
@@ -103,6 +103,40 @@ type mapRenderedMsg struct {
 	seq string
 }
 
+func fetchStyle(styleURL string) *MapStyle {
+	resp, err := http.Get(styleURL)
+	if err != nil {
+		debugf("Failed to fetch style from %s: %v", styleURL, err)
+		return nil
+	}
+	defer resp.Body.Close()
+
+	var raw struct {
+		Layers []StyleLayer `json:"layers"`
+		Sources map[string]struct {
+			Type string `json:"type"`
+			URL  string `json:"url"`
+		} `json:"sources"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		debugf("Failed to decode style JSON: %v", err)
+		return nil
+	}
+
+	renderable := make([]StyleLayer, 0, len(raw.Layers))
+	for _, l := range raw.Layers {
+		switch l.Type {
+		case "background", "fill", "line":
+			renderable = append(renderable, l)
+		default:
+			debugf("Skipping non-renderable layer %q (type=%s)", l.ID, l.Type)
+		}
+	}
+
+	debugf("Loaded style with %d renderable layers (out of %d total)", len(renderable), len(raw.Layers))
+	return &MapStyle{Layers: renderable}
+}
+
 func fetchTileURLTemplate(sourceURL string) string {
 	resp, err := http.Get(sourceURL)
 	if err != nil {
@@ -127,16 +161,17 @@ func fetchTileURLTemplate(sourceURL string) string {
 }
 
 func NewMapModel(lat, lng float64, zoom int) *MapModel {
-	var style MapStyle
-	if err := json.Unmarshal([]byte(defaultStyleJSON), &style); err != nil {
-		debugf("Error parsing default style JSON: %v", err)
-	} else {
-		debugf("Loaded style with %d layers", len(style.Layers))
+	style := fetchStyle(defaultStyleURL)
+	if style == nil {
+		debugf("Falling back to hardcoded style")
+		style = &MapStyle{Layers: []StyleLayer{
+			{ID: "background", Type: "background", Paint: PaintProps{BackgroundColor: "#f8f4f0"}},
+		}}
 	}
 
 	tileURLTemplate := fetchTileURLTemplate("https://tiles.openfreemap.org/planet")
 	if tileURLTemplate == "" {
-		tileURLTemplate = "https://tiles.openfreemap.org/planet/%d/%d/%d.pbf"
+		tileURLTemplate = "https://tiles.openfreemap.org/planet/{z}/{x}/{y}.pbf"
 	}
 
 	return &MapModel{
@@ -144,7 +179,7 @@ func NewMapModel(lat, lng float64, zoom int) *MapModel {
 		Lng:             lng,
 		Zoom:            zoom,
 		TileURLTemplate: tileURLTemplate,
-		Style:           &style,
+		Style:           style,
 		loading:         true,
 	}
 }
@@ -264,7 +299,7 @@ func (m *MapModel) renderMapCmd() tea.Cmd {
 
 		// Draw Background
 		if bgLayer := getLayerByID(m.Style, "background"); bgLayer != nil {
-			dc.SetColor(parseColor(bgLayer.Paint.BackgroundColor))
+			dc.SetColor(parseColor(resolvePaintValue(bgLayer.Paint.BackgroundColor, float64(m.Zoom))))
 		} else {
 			dc.SetColor(color.RGBA{248, 244, 240, 255})
 		}
@@ -318,6 +353,12 @@ func (m *MapModel) renderMapCmd() tea.Cmd {
 					if layerStyle.Type == "background" {
 						continue
 					}
+					if layerStyle.MinZoom != nil && float64(m.Zoom) < *layerStyle.MinZoom {
+						continue
+					}
+					if layerStyle.MaxZoom != nil && float64(m.Zoom) > *layerStyle.MaxZoom {
+						continue
+					}
 
 					var mvtLayer *mvt.Layer
 					for _, l := range collections {
@@ -338,12 +379,12 @@ func (m *MapModel) renderMapCmd() tea.Cmd {
 					filteredCount := 0
 
 					for _, feature := range mvtLayer.Features {
-						if !evaluateFilter(layerStyle.Filter, feature.Properties) {
+						if !evaluateFilter(layerStyle.Filter, feature.Properties, feature.Geometry) {
 							filteredCount++
 							continue
 						}
 
-						drawFeature(dc, feature.Geometry, offsetX, offsetY, scale, &layerStyle)
+						drawFeature(dc, feature.Geometry, offsetX, offsetY, scale, &layerStyle, float64(m.Zoom))
 						renderedCount++
 					}
 
@@ -381,11 +422,11 @@ func (m *MapModel) renderMapCmd() tea.Cmd {
 	}
 }
 
-func drawFeature(dc *gg.Context, geometry orb.Geometry, offsetX, offsetY, scale float64, style *StyleLayer) {
-	debugf("    drawFeature: type=%T, offsetX=%.2f, offsetY=%.2f, scale=%.4f", geometry, offsetX, offsetY, scale)
+func drawFeature(dc *gg.Context, geometry orb.Geometry, offsetX, offsetY, scale float64, style *StyleLayer, zoom float64) {
 	switch g := geometry.(type) {
 	case orb.Polygon:
-		dc.SetColor(parseColor(style.Paint.FillColor))
+		c := resolvePaintValue(style.Paint.FillColor, zoom)
+		dc.SetColor(parseColor(c))
 		for _, ring := range g {
 			for i, pt := range ring {
 				x := offsetX + pt[0]*scale
@@ -401,7 +442,8 @@ func drawFeature(dc *gg.Context, geometry orb.Geometry, offsetX, offsetY, scale 
 		dc.Fill()
 
 	case orb.MultiPolygon:
-		dc.SetColor(parseColor(style.Paint.FillColor))
+		c := resolvePaintValue(style.Paint.FillColor, zoom)
+		dc.SetColor(parseColor(c))
 		for _, poly := range g {
 			for _, ring := range poly {
 				for i, pt := range ring {
@@ -419,11 +461,9 @@ func drawFeature(dc *gg.Context, geometry orb.Geometry, offsetX, offsetY, scale 
 		dc.Fill()
 
 	case orb.LineString:
-		dc.SetColor(parseColor(style.Paint.LineColor))
-		lw := 1.0
-		if w, ok := style.Paint.LineWidth.(float64); ok {
-			lw = w
-		}
+		c := resolvePaintValue(style.Paint.LineColor, zoom)
+		dc.SetColor(parseColor(c))
+		lw := resolveLineWidth(style.Paint.LineWidth, zoom)
 		dc.SetLineWidth(lw)
 		for i, pt := range g {
 			x := offsetX + pt[0]*scale
@@ -437,11 +477,9 @@ func drawFeature(dc *gg.Context, geometry orb.Geometry, offsetX, offsetY, scale 
 		dc.Stroke()
 
 	case orb.MultiLineString:
-		dc.SetColor(parseColor(style.Paint.LineColor))
-		lw := 1.0
-		if w, ok := style.Paint.LineWidth.(float64); ok {
-			lw = w
-		}
+		c := resolvePaintValue(style.Paint.LineColor, zoom)
+		dc.SetColor(parseColor(c))
+		lw := resolveLineWidth(style.Paint.LineWidth, zoom)
 		dc.SetLineWidth(lw)
 		for _, ls := range g {
 			for i, pt := range ls {
@@ -455,7 +493,36 @@ func drawFeature(dc *gg.Context, geometry orb.Geometry, offsetX, offsetY, scale 
 			}
 		}
 		dc.Stroke()
+
+	case orb.Point:
+		c := resolvePaintValue(style.Paint.FillColor, zoom)
+		dc.SetColor(parseColor(c))
+		x := offsetX + g[0]*scale
+		y := offsetY + g[1]*scale
+		dc.DrawCircle(x, y, 3)
+		dc.Fill()
+
+	case orb.MultiPoint:
+		c := resolvePaintValue(style.Paint.FillColor, zoom)
+		dc.SetColor(parseColor(c))
+		for _, pt := range g {
+			x := offsetX + pt[0]*scale
+			y := offsetY + pt[1]*scale
+			dc.DrawCircle(x, y, 3)
+			dc.Fill()
+		}
 	}
+}
+
+func resolveLineWidth(val interface{}, zoom float64) float64 {
+	if val == nil {
+		return 1.0
+	}
+	r := resolvePaintValue(val, zoom)
+	if f, ok := toFloat(r); ok {
+		return f
+	}
+	return 1.0
 }
 
 // --- Fetching & Graphics Encoders ---
@@ -525,6 +592,123 @@ func encodeKittyGraphics(img *image.RGBA, cols, rows int) string {
 
 // --- Styling Helpers ---
 
+func evalExpr(expr interface{}, zoom float64) interface{} {
+	arr, ok := expr.([]interface{})
+	if !ok {
+		return expr
+	}
+	if len(arr) == 0 {
+		return expr
+	}
+
+	switch arr[0] {
+	case "interpolate":
+		return evalInterpolate(arr, zoom)
+	case "coalesce":
+		for _, v := range arr[1:] {
+			r := evalExpr(v, zoom)
+			if r != nil {
+				return r
+			}
+		}
+		return nil
+	case "get":
+		return nil
+	case "match":
+		return arr[len(arr)-1]
+	case "step":
+		return evalStep(arr, zoom)
+	default:
+		return nil
+	}
+}
+
+func evalInterpolate(arr []interface{}, zoom float64) interface{} {
+	if len(arr) < 5 {
+		return nil
+	}
+	_, ok := arr[2].([]interface{})
+	if !ok {
+		return nil
+	}
+	zoomExpr := arr[2]
+	if ze, ok := zoomExpr.([]interface{}); !ok || len(ze) < 2 || ze[0] != "zoom" {
+		return nil
+	}
+
+	type kv struct {
+		z float64
+		v interface{}
+	}
+	var pairs []kv
+	for i := 3; i < len(arr)-1; i += 2 {
+		zf, _ := toFloat(arr[i])
+		pairs = append(pairs, kv{zf, arr[i+1]})
+	}
+	if len(pairs) < 2 {
+		return pairs[0].v
+	}
+
+	if zoom <= pairs[0].z {
+		return pairs[0].v
+	}
+	if zoom >= pairs[len(pairs)-1].z {
+		return pairs[len(pairs)-1].v
+	}
+
+	for i := 0; i < len(pairs)-1; i++ {
+		if zoom >= pairs[i].z && zoom <= pairs[i+1].z {
+			z1, v1 := pairs[i].z, pairs[i].v
+			z2, v2 := pairs[i+1].z, pairs[i+1].v
+			v1f, ok1 := toFloat(v1)
+			v2f, ok2 := toFloat(v2)
+			if ok1 && ok2 && z2 != z1 {
+				t := (zoom - z1) / (z2 - z1)
+				return v1f + t*(v2f-v1f)
+			}
+			return v1
+		}
+	}
+	return pairs[len(pairs)-1].v
+}
+
+func evalStep(arr []interface{}, zoom float64) interface{} {
+	if len(arr) < 4 {
+		return nil
+	}
+	zoomExpr := arr[1]
+	if ze, ok := zoomExpr.([]interface{}); !ok || len(ze) < 2 || ze[0] != "zoom" {
+		return nil
+	}
+	output := arr[2]
+	for i := 3; i < len(arr)-1; i += 2 {
+		zf, _ := toFloat(arr[i])
+		if zoom < zf {
+			return output
+		}
+		output = arr[i+1]
+	}
+	return output
+}
+
+func toFloat(v interface{}) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func resolvePaintValue(val interface{}, zoom float64) interface{} {
+	return evalExpr(val, zoom)
+}
+
 func getLayerByID(style *MapStyle, id string) *StyleLayer {
 	for _, l := range style.Layers {
 		if l.ID == id {
@@ -534,39 +718,242 @@ func getLayerByID(style *MapStyle, id string) *StyleLayer {
 	return nil
 }
 
-func evaluateFilter(filter []interface{}, props geojson.Properties) bool {
+func evaluateFilter(filter []interface{}, props geojson.Properties, geom orb.Geometry) bool {
 	if len(filter) == 0 {
 		return true
 	}
+	result := evalFilterExpr(filter, props, geom)
+	if b, ok := result.(bool); ok {
+		return b
+	}
+	return true
+}
 
-	// Basic parsing for ["==", "class", "water"]
-	if len(filter) == 3 {
-		op, okOp := filter[0].(string)
-		key, okKey := filter[1].(string)
-		val := filter[2]
+func geometryTypeName(g orb.Geometry) string {
+	switch g.(type) {
+	case orb.Point:
+		return "Point"
+	case orb.MultiPoint:
+		return "MultiPoint"
+	case orb.LineString:
+		return "LineString"
+	case orb.MultiLineString:
+		return "MultiLineString"
+	case orb.Polygon:
+		return "Polygon"
+	case orb.MultiPolygon:
+		return "MultiPolygon"
+	case orb.Collection:
+		return "GeometryCollection"
+	default:
+		return ""
+	}
+}
 
-		if okOp && okKey {
-			propVal, hasProp := props[key]
-			if !hasProp {
-				// Handle typical mapbox style where they use ["==", ["get", "class"], "water"]
-				if getArr, isArr := filter[1].([]interface{}); isArr && len(getArr) == 2 && getArr[0] == "get" {
-					key = getArr[1].(string)
-					propVal, hasProp = props[key]
+func evalFilterExpr(expr interface{}, props geojson.Properties, geom orb.Geometry) interface{} {
+	arr, ok := expr.([]interface{})
+	if !ok {
+		return expr
+	}
+	if len(arr) == 0 {
+		return expr
+	}
+
+	op, ok := arr[0].(string)
+	if !ok {
+		return true
+	}
+
+	switch op {
+	case "get":
+		if len(arr) == 2 {
+			if key, ok := arr[1].(string); ok {
+				if key == "geometry-type" {
+					return geometryTypeName(geom)
+				}
+				if v, has := props[key]; has {
+					return v
 				}
 			}
+		}
+		return nil
 
-			if hasProp {
-				switch op {
-				case "==":
-					return fmt.Sprintf("%v", propVal) == fmt.Sprintf("%v", val)
-				case "!=":
-					return fmt.Sprintf("%v", propVal) != fmt.Sprintf("%v", val)
+	case "geometry-type":
+		return geometryTypeName(geom)
+
+	case "match":
+		return evalMatch(arr, props, geom)
+
+	case "coalesce":
+		for _, v := range arr[1:] {
+			r := evalFilterExpr(v, props, geom)
+			if r != nil {
+				return r
+			}
+		}
+		return nil
+
+	case "==":
+		if len(arr) == 3 {
+			lhs := evalFilterExpr(arr[1], props, geom)
+			rhs := evalFilterExpr(arr[2], props, geom)
+			return fmt.Sprintf("%v", lhs) == fmt.Sprintf("%v", rhs)
+		}
+		return true
+
+	case "!=":
+		if len(arr) == 3 {
+			lhs := evalFilterExpr(arr[1], props, geom)
+			rhs := evalFilterExpr(arr[2], props, geom)
+			return fmt.Sprintf("%v", lhs) != fmt.Sprintf("%v", rhs)
+		}
+		return true
+
+	case ">":
+		if len(arr) == 3 {
+			lf, ok1 := toFloat(evalFilterExpr(arr[1], props, geom))
+			rf, ok2 := toFloat(evalFilterExpr(arr[2], props, geom))
+			if ok1 && ok2 {
+				return lf > rf
+			}
+		}
+		return true
+
+	case ">=":
+		if len(arr) == 3 {
+			lf, ok1 := toFloat(evalFilterExpr(arr[1], props, geom))
+			rf, ok2 := toFloat(evalFilterExpr(arr[2], props, geom))
+			if ok1 && ok2 {
+				return lf >= rf
+			}
+		}
+		return true
+
+	case "<":
+		if len(arr) == 3 {
+			lf, ok1 := toFloat(evalFilterExpr(arr[1], props, geom))
+			rf, ok2 := toFloat(evalFilterExpr(arr[2], props, geom))
+			if ok1 && ok2 {
+				return lf < rf
+			}
+		}
+		return true
+
+	case "<=":
+		if len(arr) == 3 {
+			lf, ok1 := toFloat(evalFilterExpr(arr[1], props, geom))
+			rf, ok2 := toFloat(evalFilterExpr(arr[2], props, geom))
+			if ok1 && ok2 {
+				return lf <= rf
+			}
+		}
+		return true
+
+	case "in":
+		if len(arr) >= 3 {
+			lhs := fmt.Sprintf("%v", evalFilterExpr(arr[1], props, geom))
+			for _, v := range arr[2:] {
+				if fmt.Sprintf("%v", evalFilterExpr(v, props, geom)) == lhs {
+					return true
 				}
+			}
+			return false
+		}
+
+	case "!in":
+		if len(arr) >= 3 {
+			lhs := fmt.Sprintf("%v", evalFilterExpr(arr[1], props, geom))
+			for _, v := range arr[2:] {
+				if fmt.Sprintf("%v", evalFilterExpr(v, props, geom)) == lhs {
+					return false
+				}
+			}
+			return true
+		}
+
+	case "has":
+		if len(arr) == 2 {
+			key := resolveGetKey(arr[1])
+			_, ok := props[key]
+			return ok
+		}
+
+	case "!has":
+		if len(arr) == 2 {
+			key := resolveGetKey(arr[1])
+			_, ok := props[key]
+			return !ok
+		}
+
+	case "all":
+		for _, f := range arr[1:] {
+			r := evalFilterExpr(f, props, geom)
+			if b, ok := r.(bool); ok && !b {
+				return false
+			}
+		}
+		return true
+
+	case "any":
+		for _, f := range arr[1:] {
+			r := evalFilterExpr(f, props, geom)
+			if b, ok := r.(bool); ok && b {
+				return true
+			}
+		}
+		return false
+
+	case "!":
+		if len(arr) == 2 {
+			r := evalFilterExpr(arr[1], props, geom)
+			if b, ok := r.(bool); ok {
+				return !b
 			}
 		}
 	}
 
 	return true
+}
+
+func evalMatch(arr []interface{}, props geojson.Properties, geom orb.Geometry) interface{} {
+	if len(arr) < 4 {
+		return arr[len(arr)-1]
+	}
+	input := evalFilterExpr(arr[1], props, geom)
+	inputStr := fmt.Sprintf("%v", input)
+
+	for i := 2; i < len(arr)-1; i += 2 {
+		labels := arr[i]
+		output := arr[i+1]
+
+		switch l := labels.(type) {
+		case []interface{}:
+			for _, label := range l {
+				if fmt.Sprintf("%v", evalFilterExpr(label, props, geom)) == inputStr {
+					return output
+				}
+			}
+		default:
+			if fmt.Sprintf("%v", evalFilterExpr(labels, props, geom)) == inputStr {
+				return output
+			}
+		}
+	}
+	return arr[len(arr)-1]
+}
+
+func resolveGetKey(key interface{}) string {
+	if s, ok := key.(string); ok {
+		return s
+	}
+	if arr, ok := key.([]interface{}); ok && len(arr) == 2 {
+		if arr[0] == "get" {
+			if s, ok := arr[1].(string); ok {
+				return s
+			}
+		}
+	}
+	return ""
 }
 
 func parseColor(val interface{}) color.Color {
