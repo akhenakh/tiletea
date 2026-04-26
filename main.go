@@ -5,7 +5,6 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -20,6 +19,7 @@ import (
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/akhenakh/mvtgo"
 	"github.com/fogleman/gg"
 	"github.com/peterstace/simplefeatures/carto"
 	"github.com/peterstace/simplefeatures/geom"
@@ -27,13 +27,13 @@ import (
 
 var debugEnabled bool
 
-func debugf(format string, args ...interface{}) {
+func debugf(format string, args ...any) {
 	if debugEnabled {
 		log.Printf(format, args...)
 	}
 }
 
-func debugln(args ...interface{}) {
+func debugln(args ...any) {
 	if debugEnabled {
 		log.Println(args...)
 	}
@@ -50,23 +50,23 @@ const (
 const defaultStyleURL = "https://tiles.openfreemap.org/styles/liberty"
 
 type StyleLayer struct {
-	ID          string        `json:"id"`
-	Type        string        `json:"type"`
-	SourceLayer string        `json:"source-layer"`
-	Paint       PaintProps    `json:"paint"`
-	Filter      []interface{} `json:"filter"`
-	MinZoom     *float64      `json:"minzoom"`
-	MaxZoom     *float64      `json:"maxzoom"`
+	ID          string     `json:"id"`
+	Type        string     `json:"type"`
+	SourceLayer string     `json:"source-layer"`
+	Paint       PaintProps `json:"paint"`
+	Filter      []any      `json:"filter"`
+	MinZoom     *float64   `json:"minzoom"`
+	MaxZoom     *float64   `json:"maxzoom"`
 }
 
 type PaintProps struct {
-	BackgroundColor interface{} `json:"background-color"`
-	FillColor       interface{} `json:"fill-color"`
-	FillOpacity     interface{} `json:"fill-opacity"`
-	LineColor       interface{} `json:"line-color"`
-	LineWidth       interface{} `json:"line-width"`
-	LineOpacity     interface{} `json:"line-opacity"`
-	LineDashArray   interface{} `json:"line-dasharray"`
+	BackgroundColor any `json:"background-color"`
+	FillColor       any `json:"fill-color"`
+	FillOpacity     any `json:"fill-opacity"`
+	LineColor       any `json:"line-color"`
+	LineWidth       any `json:"line-width"`
+	LineOpacity     any `json:"line-opacity"`
+	LineDashArray   any `json:"line-dasharray"`
 }
 
 type MapStyle struct {
@@ -77,439 +77,7 @@ type TileJSON struct {
 	Tiles []string `json:"tiles"`
 }
 
-// --- MVT Parsing ---
-
-type MVTLayer struct {
-	Name     string
-	Extent   uint32
-	Features []MVTFeature
-}
-
-type MVTFeature struct {
-	ID         uint64
-	Type       int // 1=Point, 2=LineString, 3=Polygon
-	Properties map[string]interface{}
-	Geometry   geom.Geometry
-}
-
-func readVarint(buf []byte, offset int) (uint64, int, error) {
-	var v uint64
-	var shift uint
-	for {
-		if offset >= len(buf) {
-			return 0, offset, io.ErrUnexpectedEOF
-		}
-		b := buf[offset]
-		offset++
-		v |= uint64(b&0x7F) << shift
-		if b < 0x80 {
-			break
-		}
-		shift += 7
-	}
-	return v, offset, nil
-}
-
-func decodeMVT(data []byte) ([]MVTLayer, error) {
-	var layers []MVTLayer
-	offset := 0
-	for offset < len(data) {
-		tag, off, err := readVarint(data, offset)
-		if err != nil {
-			return nil, err
-		}
-		offset = off
-		wireType := int(tag & 7)
-		fieldNum := int(tag >> 3)
-
-		switch wireType {
-		case 0:
-			_, off, err = readVarint(data, offset)
-			if err != nil {
-				return nil, err
-			}
-			offset = off
-		case 1:
-			offset += 8
-		case 2:
-			length, off, err := readVarint(data, offset)
-			if err != nil || int(length) < 0 || off+int(length) > len(data) {
-				return nil, fmt.Errorf("invalid layer length")
-			}
-			offset = off
-
-			if fieldNum == 3 { // Layer
-				layer, err := decodeLayer(data[offset : offset+int(length)])
-				if err != nil {
-					return nil, err
-				}
-				layers = append(layers, layer)
-			}
-			offset += int(length)
-		case 5:
-			offset += 4
-		default:
-			return nil, fmt.Errorf("unknown wire type %d", wireType)
-		}
-	}
-	return layers, nil
-}
-
-func decodeLayer(data []byte) (MVTLayer, error) {
-	layer := MVTLayer{Extent: 4096}
-	var keys []string
-	var values []interface{}
-	var featuresData [][]byte
-
-	offset := 0
-	for offset < len(data) {
-		tag, off, err := readVarint(data, offset)
-		if err != nil {
-			return layer, err
-		}
-		offset = off
-		wireType := int(tag & 7)
-		fieldNum := int(tag >> 3)
-
-		if wireType == 0 {
-			v, off, err := readVarint(data, offset)
-			if err != nil {
-				return layer, err
-			}
-			offset = off
-			if fieldNum == 5 { // extent
-				layer.Extent = uint32(v)
-			}
-		} else if wireType == 1 {
-			offset += 8
-		} else if wireType == 5 {
-			offset += 4
-		} else if wireType == 2 {
-			length, off, err := readVarint(data, offset)
-			if err != nil || int(length) < 0 || off+int(length) > len(data) {
-				return layer, fmt.Errorf("invalid field length in layer")
-			}
-			offset = off
-
-			buf := data[offset : offset+int(length)]
-			offset += int(length)
-
-			if fieldNum == 1 { // name
-				layer.Name = string(buf)
-			} else if fieldNum == 2 { // feature
-				featuresData = append(featuresData, buf)
-			} else if fieldNum == 3 { // key
-				keys = append(keys, string(buf))
-			} else if fieldNum == 4 { // value
-				values = append(values, decodeValue(buf))
-			}
-		}
-	}
-
-	for _, fd := range featuresData {
-		feat, err := decodeFeature(fd, keys, values)
-		if err != nil {
-			return layer, err
-		}
-		layer.Features = append(layer.Features, feat)
-	}
-
-	return layer, nil
-}
-
-func decodeValue(data []byte) interface{} {
-	offset := 0
-	for offset < len(data) {
-		tag, off, err := readVarint(data, offset)
-		if err != nil {
-			return nil
-		}
-		offset = off
-		wireType := int(tag & 7)
-		fieldNum := int(tag >> 3)
-
-		if wireType == 0 {
-			v, off, err := readVarint(data, offset)
-			if err != nil {
-				return nil
-			}
-			offset = off
-			if fieldNum == 4 {
-				return int64(v)
-			} else if fieldNum == 5 {
-				return v
-			} else if fieldNum == 6 {
-				return int64((v >> 1) ^ uint64((int64(v&1)<<63)>>63))
-			} else if fieldNum == 7 {
-				return v != 0
-			}
-		} else if wireType == 1 {
-			if offset+8 > len(data) {
-				return nil
-			}
-			v := binary.LittleEndian.Uint64(data[offset:])
-			offset += 8
-			if fieldNum == 3 {
-				return math.Float64frombits(v)
-			}
-		} else if wireType == 5 {
-			if offset+4 > len(data) {
-				return nil
-			}
-			v := binary.LittleEndian.Uint32(data[offset:])
-			offset += 4
-			if fieldNum == 2 {
-				return math.Float32frombits(v)
-			}
-		} else if wireType == 2 {
-			length, off, err := readVarint(data, offset)
-			if err != nil || int(length) < 0 || offset+int(length) > len(data) {
-				return nil
-			}
-			offset = off
-			buf := data[offset : offset+int(length)]
-			offset += int(length)
-			if fieldNum == 1 {
-				return string(buf)
-			}
-		} else {
-			return nil
-		}
-	}
-	return nil
-}
-
-func decodeFeature(data []byte, keys []string, values []interface{}) (MVTFeature, error) {
-	feat := MVTFeature{Properties: make(map[string]interface{})}
-	var tags []uint32
-	var geomData []uint32
-
-	offset := 0
-	for offset < len(data) {
-		tag, off, err := readVarint(data, offset)
-		if err != nil {
-			return feat, err
-		}
-		offset = off
-		wireType := int(tag & 7)
-		fieldNum := int(tag >> 3)
-
-		if wireType == 0 {
-			v, off, err := readVarint(data, offset)
-			if err != nil {
-				return feat, err
-			}
-			offset = off
-			if fieldNum == 1 { // id
-				feat.ID = v
-			} else if fieldNum == 3 { // type
-				feat.Type = int(v)
-			}
-		} else if wireType == 2 {
-			length, off, err := readVarint(data, offset)
-			if err != nil || int(length) < 0 || off+int(length) > len(data) {
-				return feat, fmt.Errorf("invalid length in feature")
-			}
-			offset = off
-			buf := data[offset : offset+int(length)]
-			offset += int(length)
-
-			if fieldNum == 2 { // tags
-				o := 0
-				for o < len(buf) {
-					v, nextO, err := readVarint(buf, o)
-					if err != nil {
-						break
-					}
-					tags = append(tags, uint32(v))
-					o = nextO
-				}
-			} else if fieldNum == 4 { // geometry
-				o := 0
-				for o < len(buf) {
-					v, nextO, err := readVarint(buf, o)
-					if err != nil {
-						break
-					}
-					geomData = append(geomData, uint32(v))
-					o = nextO
-				}
-			}
-		} else if wireType == 1 {
-			offset += 8
-		} else if wireType == 5 {
-			offset += 4
-		}
-	}
-
-	for i := 0; i+1 < len(tags); i += 2 {
-		kIdx := int(tags[i])
-		vIdx := int(tags[i+1])
-		if kIdx < len(keys) && vIdx < len(values) {
-			k := keys[kIdx]
-			v := values[vIdx]
-			feat.Properties[k] = v
-		}
-	}
-
-	g, err := buildGeometry(feat.Type, geomData)
-	if err == nil && !g.IsEmpty() {
-		feat.Geometry = g
-	}
-
-	return feat, nil
-}
-
-func decodeZigZag(v uint32) int32 {
-	return int32((v >> 1) ^ uint32((int32(v&1)<<31)>>31))
-}
-
-func flattenXY(pts []geom.XY) []float64 {
-	res := make([]float64, 0, len(pts)*2)
-	for _, p := range pts {
-		res = append(res, p.X, p.Y)
-	}
-	return res
-}
-
-func isCW(ring []geom.XY) bool {
-	var area float64
-	for i := 0; i < len(ring)-1; i++ {
-		area += ring[i].X*ring[i+1].Y - ring[i+1].X*ring[i].Y
-	}
-	// In MVT (Y-down) screen coordinates, area > 0 is CW.
-	return area > 0
-}
-
-func buildGeometry(geomType int, geomData []uint32) (geom.Geometry, error) {
-	var cx, cy int32
-	var pts []geom.XY
-	var rings [][]geom.XY
-	var lines [][]geom.XY
-
-	i := 0
-	for i < len(geomData) {
-		cmdInteger := geomData[i]
-		i++
-		cmd := cmdInteger & 7
-		count := int(cmdInteger >> 3)
-
-		switch cmd {
-		case 1: // MoveTo
-			if geomType == 3 && len(pts) > 0 {
-				rings = append(rings, pts)
-				pts = nil
-			} else if geomType == 2 && len(pts) > 0 {
-				lines = append(lines, pts)
-				pts = nil
-			}
-			for j := 0; j < count; j++ {
-				if i+1 >= len(geomData) {
-					break
-				}
-				cx += decodeZigZag(geomData[i])
-				i++
-				cy += decodeZigZag(geomData[i])
-				i++
-				pts = append(pts, geom.XY{X: float64(cx), Y: float64(cy)})
-			}
-		case 2: // LineTo
-			for j := 0; j < count; j++ {
-				if i+1 >= len(geomData) {
-					break
-				}
-				cx += decodeZigZag(geomData[i])
-				i++
-				cy += decodeZigZag(geomData[i])
-				i++
-				pts = append(pts, geom.XY{X: float64(cx), Y: float64(cy)})
-			}
-		case 7: // ClosePath
-			if len(pts) > 0 {
-				if pts[0] != pts[len(pts)-1] {
-					pts = append(pts, pts[0])
-				}
-				rings = append(rings, pts)
-				pts = nil
-			}
-		default:
-			return geom.Geometry{}, fmt.Errorf("unknown MVT command %d", cmd)
-		}
-	}
-
-	if len(pts) > 0 {
-		if geomType == 2 {
-			lines = append(lines, pts)
-		}
-	}
-
-	switch geomType {
-	case 1: // Point
-		if len(pts) == 1 {
-			return pts[0].AsPoint().AsGeometry(), nil
-		} else if len(pts) > 1 {
-			var mpts []geom.Point
-			for _, p := range pts {
-				mpts = append(mpts, p.AsPoint())
-			}
-			return geom.NewMultiPoint(mpts).AsGeometry(), nil
-		}
-	case 2: // LineString
-		if len(lines) == 1 {
-			if len(lines[0]) < 2 {
-				return geom.Geometry{}, fmt.Errorf("LineString has < 2 points")
-			}
-			return geom.NewLineString(geom.NewSequence(flattenXY(lines[0]), geom.DimXY)).AsGeometry(), nil
-		} else if len(lines) > 1 {
-			var mls []geom.LineString
-			for _, l := range lines {
-				if len(l) >= 2 {
-					mls = append(mls, geom.NewLineString(geom.NewSequence(flattenXY(l), geom.DimXY)))
-				}
-			}
-			if len(mls) > 0 {
-				return geom.NewMultiLineString(mls).AsGeometry(), nil
-			}
-		}
-	case 3: // Polygon
-		var polys []geom.Polygon
-		var currentOuter []geom.LineString
-
-		for _, r := range rings {
-			if len(r) < 4 {
-				continue
-			}
-			seq := geom.NewSequence(flattenXY(r), geom.DimXY)
-			ls := geom.NewLineString(seq)
-
-			if isCW(r) { // Outer ring in MVT
-				if len(currentOuter) > 0 {
-					polys = append(polys, geom.NewPolygon(currentOuter))
-				}
-				currentOuter = []geom.LineString{ls}
-			} else { // Inner ring in MVT
-				if len(currentOuter) == 0 {
-					currentOuter = []geom.LineString{ls}
-				} else {
-					currentOuter = append(currentOuter, ls)
-				}
-			}
-		}
-		if len(currentOuter) > 0 {
-			polys = append(polys, geom.NewPolygon(currentOuter))
-		}
-
-		if len(polys) == 1 {
-			return polys[0].AsGeometry(), nil
-		} else if len(polys) > 1 {
-			return geom.NewMultiPolygon(polys).AsGeometry(), nil
-		}
-	}
-
-	return geom.Geometry{}, fmt.Errorf("empty or invalid geometry")
-}
-
-// --- Map Model ---
+// Map Model
 
 type MapModel struct {
 	Lat, Lng  float64
@@ -685,7 +253,7 @@ func (m *MapModel) View() tea.View {
 	return v
 }
 
-// --- Map Rendering Logic ---
+// Map Rendering Logic
 
 func (m *MapModel) renderMapCmd() tea.Cmd {
 	if m.cancel != nil {
@@ -765,7 +333,7 @@ func (m *MapModel) renderMapCmd() tea.Cmd {
 
 				debugf("Fetched %d bytes for tile %d/%d/%d", len(tileData), m.Zoom, wrapTx, ty)
 
-				collections, err := decodeMVT(tileData)
+				collections, err := mvtgo.Decode(tileData)
 				if err != nil {
 					debugf("Failed to decode MVT tile data: %v", err)
 					continue
@@ -790,7 +358,7 @@ func (m *MapModel) renderMapCmd() tea.Cmd {
 						continue
 					}
 
-					var mvtLayer *MVTLayer
+					var mvtLayer *mvtgo.Layer
 					for i, l := range collections {
 						if l.Name == layerStyle.SourceLayer {
 							mvtLayer = &collections[i]
@@ -945,7 +513,7 @@ func drawPoint(dc *gg.Context, pt geom.Point, offsetX, offsetY, scale, dpr float
 	dc.Fill()
 }
 
-func resolveLineWidth(val interface{}, zoom float64) float64 {
+func resolveLineWidth(val any, zoom float64) float64 {
 	if val == nil {
 		return 1.0
 	}
@@ -956,7 +524,7 @@ func resolveLineWidth(val interface{}, zoom float64) float64 {
 	return 1.0
 }
 
-// --- Fetching & Graphics Encoders ---
+// Fetching & Graphics Encoders
 
 func fetchTile(url string) ([]byte, error) {
 	req, _ := http.NewRequest("GET", url, nil)
@@ -1001,10 +569,7 @@ func encodeKittyGraphics(img *image.RGBA, cols, rows int) string {
 	first := true
 
 	for i := 0; i < len(encoded); i += chunkSize {
-		end := i + chunkSize
-		if end > len(encoded) {
-			end = len(encoded)
-		}
+		end := min(i+chunkSize, len(encoded))
 		chunk := encoded[i:end]
 
 		m := 1
@@ -1013,20 +578,20 @@ func encodeKittyGraphics(img *image.RGBA, cols, rows int) string {
 		}
 
 		if first {
-			b.WriteString(fmt.Sprintf("\033_Ga=T,f=32,s=%d,v=%d,c=%d,r=%d,C=1,z=-1,m=%d;%s\033\\",
-				img.Bounds().Dx(), img.Bounds().Dy(), cols, rows, m, chunk))
+			fmt.Fprintf(&b, "\033_Ga=T,f=32,s=%d,v=%d,c=%d,r=%d,C=1,z=-1,m=%d;%s\033\\",
+				img.Bounds().Dx(), img.Bounds().Dy(), cols, rows, m, chunk)
 			first = false
 		} else {
-			b.WriteString(fmt.Sprintf("\033_Gm=%d;%s\033\\", m, chunk))
+			fmt.Fprintf(&b, "\033_Gm=%d;%s\033\\", m, chunk)
 		}
 	}
 	return b.String()
 }
 
-// --- Styling Helpers ---
+// Styling Helpers
 
-func evalExpr(expr interface{}, zoom float64) interface{} {
-	arr, ok := expr.([]interface{})
+func evalExpr(expr any, zoom float64) any {
+	arr, ok := expr.([]any)
 	if !ok {
 		return expr
 	}
@@ -1056,22 +621,22 @@ func evalExpr(expr interface{}, zoom float64) interface{} {
 	}
 }
 
-func evalInterpolate(arr []interface{}, zoom float64) interface{} {
+func evalInterpolate(arr []any, zoom float64) any {
 	if len(arr) < 5 {
 		return nil
 	}
-	_, ok := arr[2].([]interface{})
+	_, ok := arr[2].([]any)
 	if !ok {
 		return nil
 	}
 	zoomExpr := arr[2]
-	if ze, ok := zoomExpr.([]interface{}); !ok || len(ze) < 2 || ze[0] != "zoom" {
+	if ze, ok := zoomExpr.([]any); !ok || len(ze) < 2 || ze[0] != "zoom" {
 		return nil
 	}
 
 	type kv struct {
 		z float64
-		v interface{}
+		v any
 	}
 	var pairs []kv
 	for i := 3; i < len(arr)-1; i += 2 {
@@ -1105,12 +670,12 @@ func evalInterpolate(arr []interface{}, zoom float64) interface{} {
 	return pairs[len(pairs)-1].v
 }
 
-func evalStep(arr []interface{}, zoom float64) interface{} {
+func evalStep(arr []any, zoom float64) any {
 	if len(arr) < 4 {
 		return nil
 	}
 	zoomExpr := arr[1]
-	if ze, ok := zoomExpr.([]interface{}); !ok || len(ze) < 2 || ze[0] != "zoom" {
+	if ze, ok := zoomExpr.([]any); !ok || len(ze) < 2 || ze[0] != "zoom" {
 		return nil
 	}
 	output := arr[2]
@@ -1124,7 +689,7 @@ func evalStep(arr []interface{}, zoom float64) interface{} {
 	return output
 }
 
-func toFloat(v interface{}) (float64, bool) {
+func toFloat(v any) (float64, bool) {
 	switch n := v.(type) {
 	case float64:
 		return n, true
@@ -1138,7 +703,7 @@ func toFloat(v interface{}) (float64, bool) {
 	}
 }
 
-func resolvePaintValue(val interface{}, zoom float64) interface{} {
+func resolvePaintValue(val any, zoom float64) any {
 	return evalExpr(val, zoom)
 }
 
@@ -1151,7 +716,7 @@ func getLayerByID(style *MapStyle, id string) *StyleLayer {
 	return nil
 }
 
-func evaluateFilter(filter []interface{}, props map[string]interface{}, geometry geom.Geometry) bool {
+func evaluateFilter(filter []any, props map[string]any, geometry geom.Geometry) bool {
 	if len(filter) == 0 {
 		return true
 	}
@@ -1187,8 +752,8 @@ func geometryTypeName(g geom.Geometry) string {
 	return ""
 }
 
-func evalFilterExpr(expr interface{}, props map[string]interface{}, geometry geom.Geometry) interface{} {
-	arr, ok := expr.([]interface{})
+func evalFilterExpr(expr any, props map[string]any, geometry geom.Geometry) any {
+	arr, ok := expr.([]any)
 	if !ok {
 		return expr
 	}
@@ -1352,7 +917,7 @@ func evalFilterExpr(expr interface{}, props map[string]interface{}, geometry geo
 	return true
 }
 
-func evalMatch(arr []interface{}, props map[string]interface{}, geometry geom.Geometry) interface{} {
+func evalMatch(arr []any, props map[string]any, geometry geom.Geometry) any {
 	if len(arr) < 4 {
 		return arr[len(arr)-1]
 	}
@@ -1364,7 +929,7 @@ func evalMatch(arr []interface{}, props map[string]interface{}, geometry geom.Ge
 		output := arr[i+1]
 
 		switch l := labels.(type) {
-		case []interface{}:
+		case []any:
 			for _, label := range l {
 				if fmt.Sprintf("%v", evalFilterExpr(label, props, geometry)) == inputStr {
 					return output
@@ -1379,11 +944,11 @@ func evalMatch(arr []interface{}, props map[string]interface{}, geometry geom.Ge
 	return arr[len(arr)-1]
 }
 
-func resolveGetKey(key interface{}) string {
+func resolveGetKey(key any) string {
 	if s, ok := key.(string); ok {
 		return s
 	}
-	if arr, ok := key.([]interface{}); ok && len(arr) == 2 {
+	if arr, ok := key.([]any); ok && len(arr) == 2 {
 		if arr[0] == "get" {
 			if s, ok := arr[1].(string); ok {
 				return s
@@ -1393,7 +958,7 @@ func resolveGetKey(key interface{}) string {
 	return ""
 }
 
-func parseColor(val interface{}) color.Color {
+func parseColor(val any) color.Color {
 	cStr, ok := val.(string)
 	if !ok {
 		return color.RGBA{0, 0, 0, 0}
@@ -1402,8 +967,8 @@ func parseColor(val interface{}) color.Color {
 	cStr = strings.TrimSpace(cStr)
 
 	// Hex (#RRGGBB or #RGB)
-	if strings.HasPrefix(cStr, "#") {
-		hex := strings.TrimPrefix(cStr, "#")
+	if after, ok0 := strings.CutPrefix(cStr, "#"); ok0 {
+		hex := after
 		if len(hex) == 3 {
 			hex = string([]byte{hex[0], hex[0], hex[1], hex[1], hex[2], hex[2]})
 		}
@@ -1490,8 +1055,6 @@ func hueToRGB(p, q, t float64) float64 {
 	}
 	return p
 }
-
-// --- Main execution ---
 
 func main() {
 	if len(os.Getenv("DEBUG")) > 0 {
