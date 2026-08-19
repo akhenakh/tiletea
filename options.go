@@ -2,6 +2,7 @@ package tiletea
 
 import (
 	"log/slog"
+	"time"
 
 	"github.com/akhenakh/maprender"
 )
@@ -78,6 +79,16 @@ func WithTileURLTemplate(template string) Option {
 // tile URL template is supplied directly.
 func WithSourceMaxZoom(maxZoom int) Option {
 	return func(m *Map) { m.sourceMaxZoom = maxZoom }
+}
+
+// WithTileCache configures the on-disk tile cache. An empty dir uses the
+// default cache directory (~/.cache/maprender). A non-positive ttl disables
+// expiry; a positive ttl expires entries older than ttl.
+func WithTileCache(dir string, ttl time.Duration) Option {
+	return func(m *Map) {
+		m.tileCacheDir = dir
+		m.tileCacheTTL = ttl
+	}
 }
 
 // WithLogger sets the logger used for render and debug output. A nil logger is

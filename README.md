@@ -100,6 +100,7 @@ functional options:
 | `WithTileSource(url)` | Override the TileJSON endpoint used to resolve the tile URL (default `DefaultSourceURL`). |
 | `WithTileURLTemplate(tmpl)` | Supply the `{z}/{x}/{y}` tile URL template directly, bypassing TileJSON. |
 | `WithSourceMaxZoom(z)` | Set the source max zoom, used for overzoom when a template is supplied directly. |
+| `WithTileCache(dir, ttl)` | Configure the on-disk tile cache (default `~/.cache/maprender`, 2-week expiry). Empty `dir` keeps the default; non-positive `ttl` disables expiry. |
 | `WithLogger(l)` | Set the `*slog.Logger` used for render/debug output. |
 | `WithAltScreen(bool)` | Enable or disable the alternate screen buffer (enabled by default). |
 

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/akhenakh/maprender"
@@ -33,6 +34,9 @@ type Map struct {
 
 	tileURLTemplate string
 	sourceMaxZoom   int
+
+	tileCacheDir string
+	tileCacheTTL time.Duration
 
 	renderedImage *image.RGBA
 	kittySequence string
@@ -211,6 +215,8 @@ func (m *Map) renderMapCmd() tea.Cmd {
 			Style:            m.style,
 			TileURLTemplate:  m.tileURLTemplate,
 			SourceMaxZoom:    m.sourceMaxZoom,
+			TileCacheDir:     m.tileCacheDir,
+			TileCacheTTL:     m.tileCacheTTL,
 			MarkerLat:        m.markerLat,
 			MarkerLng:        m.markerLng,
 			Overlays:         m.overlays,
