@@ -37,6 +37,21 @@ func WithMarker(lat, lng float64) Option {
 	}
 }
 
+// WithOverlays appends geometry overlays drawn on top of the map. Overlays are
+// drawn in WGS84 (lon-lat) coordinates and accept GeoJSON/WKT/WKB-parsed
+// geometry via the maprender.OverlayFrom* helpers.
+func WithOverlays(overlays ...maprender.Overlay) Option {
+	return func(m *Map) {
+		m.overlays = append(m.overlays, overlays...)
+	}
+}
+
+// WithFitOverlays centers and zooms the map to fit the overlays on the first
+// render. After the initial fit, the user can pan and zoom freely.
+func WithFitOverlays() Option {
+	return func(m *Map) { m.fitOverlays = true }
+}
+
 // WithStyle supplies a pre-fetched map style, bypassing style fetching.
 func WithStyle(style *maprender.MapStyle) Option {
 	return func(m *Map) { m.style = style }

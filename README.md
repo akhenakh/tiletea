@@ -93,6 +93,8 @@ functional options:
 | Option | Description |
 | --- | --- |
 | `WithMarker(lat, lng)` | Place a marker at the given coordinates. |
+| `WithOverlays(overlays...)` | Draw `maprender.Overlay` geometries on top of the map. |
+| `WithFitOverlays()` | Center and zoom the map to fit the overlays on first render. |
 | `WithStyle(style)` | Supply a pre-fetched `*maprender.MapStyle`, skipping style fetching. |
 | `WithStyleURL(url)` | Override the Mapbox GL style URL (default `DefaultStyleURL`). |
 | `WithTileSource(url)` | Override the TileJSON endpoint used to resolve the tile URL (default `DefaultSourceURL`). |
@@ -105,6 +107,55 @@ Useful methods:
 
 - `Center() (lat, lng float64)` and `Zoom() int` read the current view.
 - `SetMarker(lat, lng *float64)` sets or clears (nil) the marker.
+- `SetOverlays(overlays ...maprender.Overlay)` replaces the drawn overlays.
+- `FitOverlays() tea.Cmd` recenters and rezooms to fit the current overlays.
+
+## Geometry view
+
+`GeomView` is a Bubble Tea model that renders geometry on a map fitted to its
+bounds. It accepts GeoJSON, WKT, WKB, or a `geom.Geometry`:
+
+```go
+package main
+
+import (
+	"fmt"
+	"os"
+
+	tea "charm.land/bubbletea/v2"
+	"github.com/akhenakh/tiletea"
+)
+
+func main() {
+	gv, err := tiletea.NewGeomViewFromWKT(
+		"POLYGON((-74.02 40.70, -74.00 40.70, -74.00 40.72, -74.02 40.72, -74.02 40.70))",
+	)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	p := tea.NewProgram(gv)
+	if _, err := p.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+```
+
+Constructors: `NewGeomViewFromGeoJSON([]byte)`, `NewGeomViewFromWKT(string)`,
+`NewGeomViewFromWKB([]byte)`, `NewGeomViewFromGeometry(geom.Geometry)`, and the
+lower-level `NewGeomView([]maprender.Overlay, ...)`.
+
+Overlay colors default to a red stroke with no fill, overridable via
+`maprender.Overlay{StrokeColor, FillColor}` or GeoJSON feature properties
+(`stroke`/`fill` keys). A runnable example lives in
+[`cmd/geom`](./cmd/geom):
+
+```sh
+go run ./cmd/geom -geojson feature.geojson
+go run ./cmd/geom -wkt "LINESTRING(-74.02 40.70, -74.00 40.72)"
+```
 
 ## Controls
 

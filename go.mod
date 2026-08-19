@@ -2,7 +2,10 @@ module github.com/akhenakh/tiletea
 
 go 1.26.4
 
-require charm.land/bubbletea/v2 v2.0.7
+require (
+	charm.land/bubbletea/v2 v2.0.7
+	github.com/peterstace/simplefeatures v0.59.0
+)
 
 require (
 	codeberg.org/go-pdf/fpdf v0.12.0 // indirect
@@ -17,7 +20,6 @@ require (
 	github.com/benoitkugler/textprocessing v0.0.6 // indirect
 	github.com/go-fonts/latin-modern v0.3.3 // indirect
 	github.com/go-text/typesetting v0.3.4 // indirect
-	github.com/peterstace/simplefeatures v0.59.0 // indirect
 	github.com/srwiley/rasterx v0.0.0-20220730225603-2ab79fcdd4ef // indirect
 	github.com/srwiley/scanx v0.0.0-20190309010443-e94503791388 // indirect
 	github.com/tdewolff/canvas v0.0.0-20260809181527-bd13cbcdd680 // indirect

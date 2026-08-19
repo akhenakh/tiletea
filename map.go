@@ -22,6 +22,8 @@ type Map struct {
 	lat, lng             float64
 	zoom                 int
 	markerLat, markerLng *float64
+	overlays             []maprender.Overlay
+	fitOverlays          bool
 
 	width, height int
 
@@ -154,6 +156,23 @@ func (m *Map) SetMarker(lat, lng *float64) {
 	m.markerLng = lng
 }
 
+// SetOverlays replaces the geometry overlays drawn on top of the map. The
+// overlays are applied on the next render.
+func (m *Map) SetOverlays(overlays ...maprender.Overlay) {
+	m.overlays = overlays
+}
+
+// FitOverlays recenters and rezooms the map to fit the current overlays. It
+// returns a command that triggers the re-render, or nil when there are no
+// overlays or the viewport size is not yet known.
+func (m *Map) FitOverlays() tea.Cmd {
+	if len(m.overlays) == 0 || m.width == 0 || m.height == 0 {
+		return nil
+	}
+	m.fitOverlays = true
+	return m.renderMapCmd()
+}
+
 func (m *Map) renderMapCmd() tea.Cmd {
 	if m.cancel != nil {
 		m.cancel()
@@ -162,6 +181,19 @@ func (m *Map) renderMapCmd() tea.Cmd {
 	m.ctx = ctx
 	m.cancel = cancel
 	m.loading = true
+
+	// Fit the view to the overlays (one-shot) before the render command reads
+	// the center/zoom. Dimensions must be known.
+	if m.fitOverlays && len(m.overlays) > 0 && m.width > 0 && m.height > 0 {
+		logW := float64(m.width*cellWidth) / devicePixelRatio
+		logH := float64((m.height-1)*cellHeight) / devicePixelRatio
+		if lat, lng, zoom, err := maprender.FitOverlaysBounds(m.overlays, logW, logH); err == nil {
+			m.lat, m.lng, m.zoom = lat, lng, zoom
+		} else {
+			m.logger.Debug("failed to fit overlays", "err", err)
+		}
+		m.fitOverlays = false
+	}
 
 	return func() tea.Msg {
 		if m.width == 0 || m.height == 0 {
@@ -181,6 +213,7 @@ func (m *Map) renderMapCmd() tea.Cmd {
 			SourceMaxZoom:    m.sourceMaxZoom,
 			MarkerLat:        m.markerLat,
 			MarkerLng:        m.markerLng,
+			Overlays:         m.overlays,
 			Logger:           m.logger,
 		}
 
