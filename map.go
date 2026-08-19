@@ -38,6 +38,8 @@ type Map struct {
 	tileCacheDir string
 	tileCacheTTL time.Duration
 
+	zIndex int
+
 	renderedImage *image.RGBA
 	kittySequence string
 	loading       bool
@@ -67,6 +69,7 @@ func New(lat, lng float64, zoom int, opts ...Option) *Map {
 		sourceURL: DefaultSourceURL,
 		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 		altScreen: true,
+		zIndex:    -1,
 		loading:   true,
 	}
 	for _, opt := range opts {
@@ -233,7 +236,7 @@ func (m *Map) renderMapCmd() tea.Cmd {
 			return nil
 		}
 
-		return mapRenderedMsg{img: img, seq: encodeKittyGraphics(img, m.width, m.height-1)}
+		return mapRenderedMsg{img: img, seq: encodeKittyGraphics(img, m.width, m.height-1, m.zIndex)}
 	}
 }
 

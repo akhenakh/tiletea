@@ -106,3 +106,10 @@ func WithLogger(logger *slog.Logger) Option {
 func WithAltScreen(enabled bool) Option {
 	return func(m *Map) { m.altScreen = enabled }
 }
+
+// WithZIndex sets the Kitty graphics z-index used to draw the map image.
+// Negative values draw the image under text (the default); z=0 draws it at the
+// text layer so it covers previously drawn text.
+func WithZIndex(z int) Option {
+	return func(m *Map) { m.zIndex = z }
+}
