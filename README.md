@@ -1,8 +1,11 @@
 # tiletea
 
+
 A [Bubble Tea](https://github.com/charmbracelet/bubbletea) (v2) component that
 renders an interactive slippy map in the terminal using the
 [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/).
+
+![tiletea](img/tiletea.png)
 
 It's a thin, embeddable wrapper around
 [`github.com/akhenakh/maprender`](https://github.com/akhenakh/maprender), which
