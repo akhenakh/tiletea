@@ -44,6 +44,15 @@ type Map struct {
 	kittySequence string
 	loading       bool
 
+	// Last successfully rendered pan frame, used to reuse pixels when only
+	// the center changed (panning).
+	lastPan *maprender.PanFrame
+
+	lastRenderIncremental bool
+	lastRenderDuration    time.Duration
+
+	incremental bool
+
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -52,8 +61,11 @@ type Map struct {
 }
 
 type mapRenderedMsg struct {
-	img *image.RGBA
-	seq string
+	img         *image.RGBA
+	seq         string
+	frame       *maprender.PanFrame
+	incremental bool
+	duration    time.Duration
 }
 
 // New creates a map component centered at the given coordinates and zoom.
@@ -62,15 +74,16 @@ type mapRenderedMsg struct {
 // falling back to built-in defaults when the network is unavailable.
 func New(lat, lng float64, zoom int, opts ...Option) *Map {
 	m := &Map{
-		lat:       lat,
-		lng:       lng,
-		zoom:      zoom,
-		styleURL:  DefaultStyleURL,
-		sourceURL: DefaultSourceURL,
-		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		altScreen: true,
-		zIndex:    -1,
-		loading:   true,
+		lat:         lat,
+		lng:         lng,
+		zoom:        zoom,
+		styleURL:    DefaultStyleURL,
+		sourceURL:   DefaultSourceURL,
+		logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		altScreen:   true,
+		zIndex:      -1,
+		loading:     true,
+		incremental: true,
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -100,11 +113,13 @@ func (m *Map) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "+", "=":
 			if m.zoom < MaxZoom {
 				m.zoom++
+				m.lastPan = nil
 				return m, m.renderMapCmd()
 			}
 		case "-":
 			if m.zoom > MinZoom {
 				m.zoom--
+				m.lastPan = nil
 				return m, m.renderMapCmd()
 			}
 		case "up", "k":
@@ -125,6 +140,9 @@ func (m *Map) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.renderedImage = msg.img
 		m.kittySequence = msg.seq
+		m.lastPan = msg.frame
+		m.lastRenderIncremental = msg.incremental
+		m.lastRenderDuration = msg.duration
 		return m, nil
 	}
 
@@ -137,8 +155,8 @@ func (m *Map) View() tea.View {
 	if m.loading && m.kittySequence == "" {
 		content = "Loading map...\nControls: Arrows to pan, +/- to zoom, q to quit."
 	} else {
-		content = fmt.Sprintf("Lat: %.4f | Lng: %.4f | Zoom: %d | Loading: %v\n",
-			m.lat, m.lng, m.zoom, m.loading) + m.kittySequence
+		content = fmt.Sprintf("Lat: %.4f | Lng: %.4f | Zoom: %d | Loading: %v | Inc: %v | Render: %s in %s\n",
+			m.lat, m.lng, m.zoom, m.loading, m.incremental, renderMode(m.lastRenderIncremental), m.lastRenderDuration) + m.kittySequence
 	}
 
 	v := tea.NewView(content)
@@ -156,17 +174,28 @@ func (m *Map) Zoom() int {
 	return m.zoom
 }
 
+// SetIncremental enables or disables incremental rendering for pans. It is
+// enabled by default.
+func (m *Map) SetIncremental(enabled bool) {
+	m.incremental = enabled
+	if !enabled {
+		m.lastPan = nil
+	}
+}
+
 // SetMarker sets the optional marker location. A nil lat or lng clears the
 // marker.
 func (m *Map) SetMarker(lat, lng *float64) {
 	m.markerLat = lat
 	m.markerLng = lng
+	m.lastPan = nil
 }
 
 // SetOverlays replaces the geometry overlays drawn on top of the map. The
 // overlays are applied on the next render.
 func (m *Map) SetOverlays(overlays ...maprender.Overlay) {
 	m.overlays = overlays
+	m.lastPan = nil
 }
 
 // FitOverlays recenters and rezooms the map to fit the current overlays. It
@@ -202,6 +231,10 @@ func (m *Map) renderMapCmd() tea.Cmd {
 		m.fitOverlays = false
 	}
 
+	// Snapshot the last rendered pan frame so panning can reuse its
+	// label-free base pixels via RenderIncremental.
+	prevPan := m.lastPan
+
 	return func() tea.Msg {
 		if m.width == 0 || m.height == 0 {
 			m.logger.Debug("skipping render", "reason", "zero size")
@@ -226,7 +259,27 @@ func (m *Map) renderMapCmd() tea.Cmd {
 			Logger:           m.logger,
 		}
 
-		img, err := maprender.Render(ctx, req)
+		start := time.Now()
+		var frame *maprender.PanFrame
+		var err error
+		if m.incremental {
+			frame, err = maprender.RenderIncremental(ctx, req, prevPan)
+		} else {
+			var img *image.RGBA
+			img, err = maprender.Render(ctx, req)
+			if err == nil {
+				// A full render includes labels; its pixels are not safe to
+				// reuse as a pan base (Base == nil forces a clean redraw if
+				// incremental mode is turned back on).
+				frame = &maprender.PanFrame{
+					Image:     img,
+					CenterLat: req.CenterLat,
+					CenterLng: req.CenterLng,
+					Zoom:      req.Zoom,
+				}
+			}
+		}
+		duration := time.Since(start)
 		if err != nil {
 			if ctx.Err() != nil {
 				m.logger.Debug("render cancelled")
@@ -235,9 +288,24 @@ func (m *Map) renderMapCmd() tea.Cmd {
 			}
 			return nil
 		}
+		incremental := m.incremental
+		m.logger.Debug("render done", "incremental", incremental, "duration", duration)
 
-		return mapRenderedMsg{img: img, seq: encodeKittyGraphics(img, m.width, m.height-1, m.zIndex)}
+		return mapRenderedMsg{
+			img:         frame.Image,
+			seq:         encodeKittyGraphics(frame.Image, m.width, m.height-1, m.zIndex),
+			frame:       frame,
+			incremental: incremental,
+			duration:    duration,
+		}
 	}
+}
+
+func renderMode(incremental bool) string {
+	if incremental {
+		return "incremental"
+	}
+	return "full"
 }
 
 func (m *Map) resolveStyle() {

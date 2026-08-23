@@ -11,6 +11,30 @@ import (
 	"github.com/akhenakh/tiletea"
 )
 
+// app wraps the map model to add a toggle between incremental and full
+// rendering, so panning performance can be compared visually.
+type app struct {
+	m           *tiletea.Map
+	incremental bool
+}
+
+func (a *app) Init() tea.Cmd { return a.m.Init() }
+
+func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if key, ok := msg.(tea.KeyMsg); ok && key.String() == "i" {
+		a.incremental = !a.incremental
+		a.m.SetIncremental(a.incremental)
+		return a, nil
+	}
+	model, cmd := a.m.Update(msg)
+	a.m = model.(*tiletea.Map)
+	return a, cmd
+}
+
+func (a *app) View() tea.View {
+	return a.m.View()
+}
+
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	if os.Getenv("DEBUG") != "" {
@@ -30,7 +54,7 @@ func main() {
 		tiletea.WithLogger(logger),
 	)
 
-	p := tea.NewProgram(m)
+	p := tea.NewProgram(&app{m: m, incremental: true})
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
