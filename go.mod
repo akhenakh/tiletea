@@ -35,7 +35,7 @@ require (
 )
 
 require (
-	github.com/akhenakh/maprender v0.0.0-20260823002747-3d03aa0dbab0
+	github.com/akhenakh/maprender v0.0.0-20260824230925-ca8cfbf0bb25
 	github.com/charmbracelet/colorprofile v0.4.3 // indirect
 	github.com/charmbracelet/ultraviolet v0.0.0-20260525132238-948f4557a654 // indirect
 	github.com/charmbracelet/x/ansi v0.11.7 // indirect
