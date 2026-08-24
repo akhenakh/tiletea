@@ -28,6 +28,8 @@ type Map struct {
 
 	width, height int
 
+	onClick func(lat, lng float64)
+
 	styleURL  string
 	sourceURL string
 	style     *maprender.MapStyle
@@ -50,6 +52,8 @@ type Map struct {
 
 	lastRenderIncremental bool
 	lastRenderDuration    time.Duration
+
+	statusExtra string
 
 	incremental bool
 
@@ -136,6 +140,13 @@ func (m *Map) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.renderMapCmd()
 		}
 
+	case tea.MouseClickMsg:
+		if msg.Button == tea.MouseLeft && m.onClick != nil {
+			if lat, lng, ok := m.clickToLatLng(msg.X, msg.Y); ok {
+				m.onClick(lat, lng)
+			}
+		}
+
 	case mapRenderedMsg:
 		m.loading = false
 		m.renderedImage = msg.img
@@ -155,12 +166,19 @@ func (m *Map) View() tea.View {
 	if m.loading && m.kittySequence == "" {
 		content = "Loading map...\nControls: Arrows to pan, +/- to zoom, q to quit."
 	} else {
-		content = fmt.Sprintf("Lat: %.4f | Lng: %.4f | Zoom: %d | Loading: %v | Inc: %v | Render: %s in %s\n",
-			m.lat, m.lng, m.zoom, m.loading, m.incremental, renderMode(m.lastRenderIncremental), m.lastRenderDuration) + m.kittySequence
+		status := fmt.Sprintf("Lat: %.4f | Lng: %.4f | Zoom: %d | Loading: %v | Inc: %v | Render: %s in %s",
+			m.lat, m.lng, m.zoom, m.loading, m.incremental, renderMode(m.lastRenderIncremental), m.lastRenderDuration)
+		if m.statusExtra != "" {
+			status += " | " + m.statusExtra
+		}
+		content = status + "\n" + m.kittySequence
 	}
 
 	v := tea.NewView(content)
 	v.AltScreen = m.altScreen
+	if m.onClick != nil {
+		v.MouseMode = tea.MouseModeCellMotion
+	}
 	return v
 }
 
@@ -207,6 +225,20 @@ func (m *Map) FitOverlays() tea.Cmd {
 	}
 	m.fitOverlays = true
 	return m.renderMapCmd()
+}
+
+// Refresh returns a command that re-renders the map with the current state
+// (center, zoom, marker, overlays). Use it after mutating the map externally,
+// e.g. from a click callback.
+func (m *Map) Refresh() tea.Cmd {
+	m.lastPan = nil
+	return m.renderMapCmd()
+}
+
+// SetStatusExtra sets an optional extra segment displayed at the end of the
+// status line. An empty string removes it.
+func (m *Map) SetStatusExtra(s string) {
+	m.statusExtra = s
 }
 
 func (m *Map) renderMapCmd() tea.Cmd {
