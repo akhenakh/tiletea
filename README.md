@@ -163,11 +163,12 @@ go run ./cmd/geom -wkt "LINESTRING(-74.02 40.70, -74.00 40.72)"
 
 ## Controls
 
-| Keys | Action |
+| Keys / Mouse | Action |
 | --- | --- |
 | Arrow keys / `h` `j` `k` `l` | Pan |
 | `+` / `=` | Zoom in |
 | `-` | Zoom out |
+| Mouse wheel up/down | Zoom in/out |
 | `q` / `ctrl+c` | Quit |
 
 ## Ultraviolet version caveat

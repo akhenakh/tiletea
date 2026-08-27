@@ -115,17 +115,9 @@ func (m *Map) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 		case "+", "=":
-			if m.zoom < MaxZoom {
-				m.zoom++
-				m.lastPan = nil
-				return m, m.renderMapCmd()
-			}
+			return m, m.zoomBy(1)
 		case "-":
-			if m.zoom > MinZoom {
-				m.zoom--
-				m.lastPan = nil
-				return m, m.renderMapCmd()
-			}
+			return m, m.zoomBy(-1)
 		case "up", "k":
 			m.lat += panStep(m.zoom)
 			return m, m.renderMapCmd()
@@ -147,6 +139,14 @@ func (m *Map) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case tea.MouseWheelMsg:
+		switch msg.Button {
+		case tea.MouseWheelUp:
+			return m, m.zoomBy(1)
+		case tea.MouseWheelDown:
+			return m, m.zoomBy(-1)
+		}
+
 	case mapRenderedMsg:
 		m.loading = false
 		m.renderedImage = msg.img
@@ -164,7 +164,7 @@ func (m *Map) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Map) View() tea.View {
 	var content string
 	if m.loading && m.kittySequence == "" {
-		content = "Loading map...\nControls: Arrows to pan, +/- to zoom, q to quit."
+		content = "Loading map...\nControls: Arrows to pan, +/- or scroll to zoom, q to quit."
 	} else {
 		status := fmt.Sprintf("Lat: %.4f | Lng: %.4f | Zoom: %d | Loading: %v | Inc: %v | Render: %s in %s",
 			m.lat, m.lng, m.zoom, m.loading, m.incremental, renderMode(m.lastRenderIncremental), m.lastRenderDuration)
@@ -176,9 +176,9 @@ func (m *Map) View() tea.View {
 
 	v := tea.NewView(content)
 	v.AltScreen = m.altScreen
-	if m.onClick != nil {
-		v.MouseMode = tea.MouseModeCellMotion
-	}
+	// Mouse reporting is required for wheel zoom (and clicks), regardless of
+	// whether a click callback is registered.
+	v.MouseMode = tea.MouseModeCellMotion
 	return v
 }
 
@@ -372,6 +372,19 @@ func fallbackStyle() *maprender.MapStyle {
 	return &maprender.MapStyle{Layers: []maprender.StyleLayer{
 		{ID: "background", Type: "background", Paint: maprender.PaintProps{BackgroundColor: "#f8f4f0"}},
 	}}
+}
+
+// zoomBy adjusts the zoom level by delta, clamped to MinZoom..MaxZoom. It
+// returns a command that re-renders the map, or nil when the zoom did not
+// change.
+func (m *Map) zoomBy(delta int) tea.Cmd {
+	z := m.zoom + delta
+	if z < MinZoom || z > MaxZoom {
+		return nil
+	}
+	m.zoom = z
+	m.lastPan = nil
+	return m.renderMapCmd()
 }
 
 func panStep(zoom int) float64 {

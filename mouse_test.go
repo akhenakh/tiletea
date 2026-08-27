@@ -3,7 +3,49 @@ package tiletea
 import (
 	"math"
 	"testing"
+
+	tea "charm.land/bubbletea/v2"
 )
+
+func TestWheelZoom(t *testing.T) {
+	m := New(40.7128, -74.0060, 14)
+	_ = m.Init() // mark the map as loading so Update runs normally
+
+	tests := []struct {
+		name   string
+		msg    tea.Msg
+		zoom   int
+		hasCmd bool
+	}{
+		{"wheel up zooms in", tea.MouseWheelMsg{Button: tea.MouseWheelUp}, 15, true},
+		{"wheel down zooms out", tea.MouseWheelMsg{Button: tea.MouseWheelDown}, 13, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m.zoom = 14
+			gotModel, cmd := m.Update(tt.msg)
+			if gotModel.(*Map) != m {
+				t.Fatal("expected the same map model to be returned")
+			}
+			if m.zoom != tt.zoom {
+				t.Fatalf("zoom = %d, want %d", m.zoom, tt.zoom)
+			}
+			if (cmd != nil) != tt.hasCmd {
+				t.Fatalf("cmd = %v, want non-nil: %v", cmd, tt.hasCmd)
+			}
+		})
+	}
+
+	// Zooming past the limits is a no-op with no re-render command.
+	m.zoom = MaxZoom
+	if cmd := m.zoomBy(1); cmd != nil || m.zoom != MaxZoom {
+		t.Fatalf("zoom-in at MaxZoom: cmd=%v, zoom=%d", cmd, m.zoom)
+	}
+	m.zoom = MinZoom
+	if cmd := m.zoomBy(-1); cmd != nil || m.zoom != MinZoom {
+		t.Fatalf("zoom-out at MinZoom: cmd=%v, zoom=%d", cmd, m.zoom)
+	}
+}
 
 func TestClickToLatLng(t *testing.T) {
 	lat, lng := 40.7128, -74.0060
